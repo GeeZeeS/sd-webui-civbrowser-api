@@ -3,6 +3,8 @@ import sys
 import json
 import re
 import requests
+import time
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Union
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from pydantic import BaseModel, Field
@@ -719,6 +721,172 @@ def add_api_routes(app: FastAPI):
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error deleting model: {str(e)}")
+
+    class CleanupRequest(BaseModel):
+    older_than_hours: int = Field(12, ge=1, le=24*90,
+                                  description="Delete files older than this many hours (default: 12)")
+    model_types: Optional[List[str]] = Field(
+        None,
+        description="Subset of model types to clean. Defaults to all known types."
+    )
+    dry_run: bool = Field(False, description="If true, only report what would be deleted")
+    empty_trash: bool = Field(False, description="If true, empty trash after deletions")
+
+class CleanupResponse(BaseModel):
+    success: bool
+    dry_run: bool
+    older_than_hours: int
+    total_candidates: int
+    total_deleted: int
+    freed_bytes: int
+    freed_mb: float
+    details: List[Dict[str, Any]]
+    trash_emptied: bool = False
+    methods_tried: List[str] = []
+
+def _safe_delete_to_trash_or_remove(file_path: str) -> str:
+    """
+    Try to move file to trash (trash-cli or gio). Fallback to direct removal.
+    Returns deletion method used.
+    """
+    import subprocess
+    # 1) trash-cli
+    try:
+        subprocess.run(["trash-put", file_path], check=True)
+        return "trash-cli"
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    # 2) gio
+    try:
+        subprocess.run(["gio", "trash", file_path], check=True)
+        return "gio"
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    # 3) direct
+    os.remove(file_path)
+    return "direct"
+
+def _empty_trash_now() -> (bool, List[str]):
+    import subprocess
+    methods = []
+    # trash-empty
+    try:
+        subprocess.run(["trash-empty"], check=True)
+        methods.append("trash-empty command")
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    # gio --empty
+    try:
+        subprocess.run(["gio", "trash", "--empty"], check=True)
+        methods.append("gio trash --empty command")
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    # direct rm fallback
+    ok = True
+    try:
+        subprocess.run(["rm", "-rf", os.path.expanduser("~/.local/share/Trash/files")], check=True)
+        subprocess.run(["rm", "-rf", os.path.expanduser("~/.local/share/Trash/info")], check=True)
+        methods.append("direct rm -rf command")
+    except subprocess.SubprocessError:
+        ok = False
+    # verify emptiness
+    trash_empty = not os.path.exists(os.path.expanduser("~/.local/share/Trash/files")) and \
+                  not os.path.exists(os.path.expanduser("~/.local/share/Trash/info"))
+    return (ok and trash_empty), methods
+
+@app.post("/civitai/cleanup/older-than", response_model=CleanupResponse, tags=["Civitai Browser"])
+async def cleanup_models_older_than(request: CleanupRequest = Body(...)):
+    """
+    Delete files older than N hours inside known model folders.
+    - Respects model_types (defaults to all known)
+    - Dry-run support
+    - Moves to trash when possible
+    """
+    try:
+        known_types = ["checkpoint", "ckpt", "lora", "lycoris", "embedding", "hypernetwork", "vae"]
+        target_types = request.model_types or known_types
+
+        cutoff_epoch = time.time() - (request.older_than_hours * 3600)
+        total_candidates = 0
+        total_deleted = 0
+        freed_bytes = 0
+        details: List[Dict[str, Any]] = []
+
+        for t in target_types:
+            folder = get_model_folder(t)
+            if not folder or not os.path.exists(folder):
+                details.append({
+                    "model_type": t,
+                    "folder": folder,
+                    "error": "Folder not found or unsupported model_type"
+                })
+                continue
+
+            try:
+                for entry in os.scandir(folder):
+                    # Only regular files
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    try:
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                        if mtime < cutoff_epoch:
+                            size_b = entry.stat(follow_symlinks=False).st_size
+                            total_candidates += 1
+
+                            if request.dry_run:
+                                details.append({
+                                    "model_type": t,
+                                    "path": entry.path,
+                                    "size_bytes": size_b,
+                                    "last_modified": mtime,
+                                    "action": "would_delete"
+                                })
+                            else:
+                                method = _safe_delete_to_trash_or_remove(entry.path)
+                                total_deleted += 1
+                                freed_bytes += size_b
+                                details.append({
+                                    "model_type": t,
+                                    "path": entry.path,
+                                    "size_bytes": size_b,
+                                    "last_modified": mtime,
+                                    "deleted_via": method
+                                })
+                    except FileNotFoundError:
+                        # File might disappear between listing and stat/delete
+                        continue
+                    except PermissionError as e:
+                        details.append({
+                            "model_type": t,
+                            "path": entry.path,
+                            "error": f"PermissionError: {e}"
+                        })
+            except Exception as e:
+                details.append({
+                    "model_type": t,
+                    "folder": folder,
+                    "error": f"Error scanning folder: {e}"
+                })
+
+        trash_emptied = False
+        methods_tried: List[str] = []
+        if not request.dry_run and request.empty_trash:
+            trash_emptied, methods_tried = _empty_trash_now()
+
+        return CleanupResponse(
+            success=True,
+            dry_run=request.dry_run,
+            older_than_hours=request.older_than_hours,
+            total_candidates=total_candidates,
+            total_deleted=total_deleted,
+            freed_bytes=freed_bytes,
+            freed_mb=round(freed_bytes / (1024 * 1024), 2),
+            details=details,
+            trash_emptied=trash_emptied,
+            methods_tried=methods_tried
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error during cleanup: {str(e)}")
     
     # Empty trash endpoint
     @app.post("/civitai/empty-trash", tags=["Civitai Browser"])
