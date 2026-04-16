@@ -135,7 +135,7 @@ def add_api_routes(app: FastAPI):
             # If not available, create minimal version
             class MinimalCivitaiAPI:
                 def __init__(self):
-                    self.base_url = "https://civitai.com/api/v1"
+                    self.base_url = "https://civitai.red/api/v1"
                     self.headers = {"Content-Type": "application/json"}
                     
                     # Add API key if available
