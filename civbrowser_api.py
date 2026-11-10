@@ -16,11 +16,11 @@ class CivitaiAPISettings:
     def __init__(self):
         self.api_key = None
         self.settings_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "civitai_api_settings.json"
         )
         self.load_settings()
-    
+
     def load_settings(self):
         """Load settings from JSON file"""
         try:
@@ -31,7 +31,7 @@ class CivitaiAPISettings:
                     print("Civitai API settings loaded")
         except Exception as e:
             print(f"Error loading Civitai API settings: {e}")
-    
+
     def save_settings(self):
         """Save settings to JSON file"""
         try:
@@ -50,24 +50,26 @@ civitai_settings = CivitaiAPISettings()
 # Add the API route manually
 def add_api_routes(app: FastAPI):
     """Add the Civitai Browser API routes"""
-    
+
     # Model request validation
     class ModelCheckRequest(BaseModel):
         model_id: int = Field(..., description="Civitai Model ID")
         model_type: str = Field(..., description="Model type (checkpoint, lora, etc.)")
         version_id: Optional[int] = Field(None, description="Specific version ID (defaults to latest)")
+        filename: Optional[str] = Field(None, description="Local filename to look for (defaults to the Civitai uploaded filename)")
 
     class ModelDownloadRequest(BaseModel):
         model_id: int = Field(..., description="Civitai Model ID")
         model_type: str = Field(..., description="Model type (checkpoint, lora, etc.)")
         version_id: Optional[int] = Field(None, description="Specific version ID (defaults to latest)")
         force: Optional[bool] = Field(False, description="Force download even if exists")
+        filename: Optional[str] = Field(None, description="Local filename to save as (defaults to the Civitai uploaded filename)")
 
     class ModelResponse(BaseModel):
         exists: bool = Field(..., description="Whether the model exists locally")
         model_id: int = Field(..., description="Civitai Model ID")
         version_id: Optional[int] = Field(None, description="Version ID")
-        filename: Optional[str] = Field(None, description="Original filename from Civitai")
+        filename: Optional[str] = Field(None, description="Filename that was looked for (requested or Civitai's)")
         found_file: Optional[str] = Field(None, description="Actual filename found locally (may differ)")
         path: Optional[str] = Field(None, description="Full path if exists")
 
@@ -94,27 +96,27 @@ def add_api_routes(app: FastAPI):
             # Update the API key in settings
             civitai_settings.api_key = request.api_key
             success = civitai_settings.save_settings()
-            
+
             return {
                 "success": success,
                 "message": "API key updated successfully" if success else "Failed to save API key"
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error updating API key: {str(e)}")
-    
+
     @app.get("/civitai/settings/api-key-status", tags=["Civitai Browser"])
     async def get_api_key_status():
         """Check if a Civitai API key is configured"""
         try:
             has_key = civitai_settings.api_key is not None and civitai_settings.api_key.strip() != ""
-            
+
             return {
                 "has_api_key": has_key,
                 "message": "API key is configured" if has_key else "No API key configured"
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error checking API key status: {str(e)}")
-        
+
     # Helper functions
     def get_civitai_api():
         """Get the CivitaiAPI instance"""
@@ -124,12 +126,12 @@ def add_api_routes(app: FastAPI):
             if civbrowser_path not in sys.path:
                 sys.path.append(civbrowser_path)
             from scripts.civitai_api import CivitaiAPI
-            
+
             # Create API instance with API key if available
             api = CivitaiAPI()
             if civitai_settings.api_key:
                 api.headers["Authorization"] = f"Bearer {civitai_settings.api_key}"
-            
+
             return api
         except ImportError:
             # If not available, create minimal version
@@ -137,16 +139,16 @@ def add_api_routes(app: FastAPI):
                 def __init__(self):
                     self.base_url = "https://civitai.com/api/v1"
                     self.headers = {"Content-Type": "application/json"}
-                    
+
                     # Add API key if available
                     if civitai_settings.api_key:
                         self.headers["Authorization"] = f"Bearer {civitai_settings.api_key}"
-                    
+
                 def get_model(self, model_id):
                     url = f"{self.base_url}/models/{model_id}"
                     response = requests.get(url, headers=self.headers)
                     return response.json()
-            
+
             return MinimalCivitaiAPI()
 
     def get_model_folder(model_type):
@@ -165,36 +167,50 @@ def add_api_routes(app: FastAPI):
             "hypernetwork": os.path.join(shared.models_path, "hypernetworks"),
             "vae": os.path.join(shared.models_path, "VAE"),
         }
-        
+
         # Normalize model type
         model_type = model_type.lower()
-        
+
         if model_type in folders:
             folder = folders[model_type]
             os.makedirs(folder, exist_ok=True)
             return folder
-        
+
         # If not found, return None
         return None
+
+    def validate_filename(filename):
+        """Reject a requested filename that would escape the model folder"""
+        if filename is None:
+            return None
+        if (
+            not filename
+            or filename in (".", "..")
+            or os.path.basename(filename) != filename
+            or "/" in filename
+            or "\\" in filename
+        ):
+            raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
+        return filename
 
     def find_model_file(model_filename, model_type):
         """Find a model file in the appropriate folder, handling various naming patterns"""
         folder = get_model_folder(model_type)
         if not folder:
             return None
-        
+
         # Debug info
         print(f"Looking for model file: {model_filename} in {folder}")
-        
+
         # Extract base name and extension
         name_without_ext, ext = os.path.splitext(model_filename)
-        
+
         # Check if file exists with exact name
         full_path = os.path.join(folder, model_filename)
         if os.path.exists(full_path):
             print(f"Found exact match: {full_path}")
             return full_path
-        
+
         # Check for common extensions if no extension or different extension
         if not ext:
             extensions = [".safetensors", ".ckpt", ".pt"]
@@ -203,26 +219,26 @@ def add_api_routes(app: FastAPI):
                 if os.path.exists(test_path):
                     print(f"Found extension match: {test_path}")
                     return test_path
-        
+
         # Check for files with ID suffix pattern (name_123456.ext)
         try:
             files_in_dir = os.listdir(folder)
         except Exception as e:
             print(f"Error listing files in directory: {e}")
             return None
-        
+
         # First try to match exact name with any suffix
         suffix_pattern = f"{re.escape(name_without_ext)}_[0-9]+"
         if ext:
             suffix_pattern += f"\\{ext}$"
-        
+
         suffix_regex = re.compile(suffix_pattern)
-        
+
         for filename in files_in_dir:
             if suffix_regex.match(filename):
                 print(f"Found ID suffix match: {filename}")
                 return os.path.join(folder, filename)
-        
+
         # Try more flexible matching (case insensitive, partial match)
         # This handles cases where the name might be slightly different
         name_lower = name_without_ext.lower()
@@ -236,17 +252,23 @@ def add_api_routes(app: FastAPI):
             elif name_lower in file_lower and any(file_lower.endswith(e) for e in [".safetensors", ".ckpt", ".pt"]):
                 print(f"Found partial name match with common extension: {filename}")
                 return os.path.join(folder, filename)
-        
+
         # If nothing is found, return None
         print(f"No matching file found for {model_filename}")
         return None
 
     def download_model_file(url, dest_path):
-        """Download a file with progress reporting and rename to remove numeric suffix"""
+        """Download a file to dest_path.
+
+        Writes to dest_path + ".part" first and renames it on success, so an
+        interrupted download never leaves a file under the final name.
+        Returns (success, final_path).
+        """
+        tmp_path = f"{dest_path}.part"
         try:
             # Create directory if needed
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            
+
             # Modify URL to include token if available
             if civitai_settings.api_key:
                 # Check if URL already has query parameters
@@ -258,47 +280,36 @@ def add_api_routes(app: FastAPI):
             else:
                 download_url = url
                 print("No API key configured, using URL without token")
-            
+
             print(f"Downloading from URL: {download_url.replace(civitai_settings.api_key, 'TOKEN_HIDDEN') if civitai_settings.api_key else download_url}")
-            
+
             # Download the file
             with requests.get(download_url, stream=True) as r:
                 # Print response info for debugging
                 print(f"Response status: {r.status_code}")
                 print(f"Response headers: {dict(r.headers)}")
-                
+
                 r.raise_for_status()
                 total = int(r.headers.get('content-length', 0))
-                
-                with open(dest_path, 'wb') as f:
+
+                with open(tmp_path, 'wb') as f:
                     downloaded = 0
                     for chunk in r.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            
+
                             # Print progress
                             if total > 0:
                                 percent = (downloaded / total) * 100
                                 sys.stdout.write(f"\rDownloading: {percent:.1f}% ({downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB)")
                                 sys.stdout.flush()
-            
+
+                if total > 0 and downloaded != total:
+                    raise IOError(f"Incomplete download: got {downloaded} of {total} bytes")
+
+            os.replace(tmp_path, dest_path)
             print(f"\nDownload completed: {dest_path}")
-            
-            # Rename file to remove numeric suffix
-            file_dir = os.path.dirname(dest_path)
-            file_name = os.path.basename(dest_path)
-            
-            # Use regex to remove the numeric suffix before the extension
-            import re
-            new_file_name = re.sub(r'_\d+(\.\w+)$', r'\1', file_name)
-            
-            if new_file_name != file_name:
-                new_dest_path = os.path.join(file_dir, new_file_name)
-                os.rename(dest_path, new_dest_path)
-                print(f"File renamed from {file_name} to {new_file_name}")
-                return True, new_dest_path
-            
             return True, dest_path
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
@@ -325,22 +336,30 @@ def add_api_routes(app: FastAPI):
         except Exception as e:
             print(f"Download error: {str(e)}")
             return False, None
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     # Check if model exists endpoint
     @app.post("/civitai/exists", response_model=ModelResponse, tags=["Civitai Browser"])
     async def check_model_exists(request: ModelCheckRequest):
         """Check if a model is already downloaded"""
         try:
+            requested_filename = validate_filename(request.filename)
+
             # Get CivitaiAPI instance
             civitai_api = get_civitai_api()
-            
+
             # Get model details from Civitai
             model_info = civitai_api.get_model(request.model_id)
-            
+
             # Get or select version
             version = None
             version_id = request.version_id
-            
+
             if version_id:
                 # Find specific version
                 for v in model_info.get("modelVersions", []):
@@ -352,33 +371,33 @@ def add_api_routes(app: FastAPI):
                 if model_info.get("modelVersions"):
                     version = model_info["modelVersions"][0]
                     version_id = version.get("id")
-            
+
             if not version:
                 raise HTTPException(status_code=404, detail="Model version not found")
-            
+
             # Find primary file
             file_info = None
             for file in version.get("files", []):
                 if file.get("primary", False):
                     file_info = file
                     break
-            
+
             # If no primary file, use first file
             if not file_info and version.get("files"):
                 file_info = version["files"][0]
-            
+
             if not file_info:
                 raise HTTPException(status_code=404, detail="No files found for this model version")
-            
-            # Get filename
-            filename = file_info.get("name")
-            
+
+            # Use the caller's filename if given, otherwise Civitai's uploaded filename
+            filename = requested_filename or file_info.get("name")
+
             # Check if file exists
             file_path = find_model_file(filename, request.model_type)
-            
+
             # Get actual filename if found
             found_file = os.path.basename(file_path) if file_path else None
-            
+
             return {
                 "exists": file_path is not None,
                 "model_id": request.model_id,
@@ -387,7 +406,7 @@ def add_api_routes(app: FastAPI):
                 "found_file": found_file,
                 "path": file_path
             }
-        
+
         except HTTPException:
             raise
         except Exception as e:
@@ -401,16 +420,19 @@ def add_api_routes(app: FastAPI):
     async def download_model(request: ModelDownloadRequest):
         """Download a model from Civitai if not already downloaded"""
         try:
+            requested_filename = validate_filename(request.filename)
+
             # First check if model exists
             check_request = ModelCheckRequest(
                 model_id=request.model_id,
                 model_type=request.model_type,
-                version_id=request.version_id
+                version_id=request.version_id,
+                filename=requested_filename,
             )
-            
+
             # Get model existence info
             model_exists = await check_model_exists(check_request)
-            
+
             # If model exists and not forcing download, return early
             if model_exists["exists"] and not request.force:
                 return {
@@ -420,21 +442,21 @@ def add_api_routes(app: FastAPI):
                     "model_id": request.model_id,
                     "version_id": model_exists["version_id"]
                 }
-            
+
             # Get model folder
             folder = get_model_folder(request.model_type)
             if not folder:
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=400,
                     detail=f"Invalid model type: {request.model_type}. Available types: checkpoint, lora, lycoris, embedding, hypernetwork, vae"
                 )
-            
+
             # Get CivitaiAPI instance
             civitai_api = get_civitai_api()
-            
+
             # Get model details
             model_info = civitai_api.get_model(request.model_id)
-            
+
             # Select version
             version = None
             if request.version_id:
@@ -445,56 +467,53 @@ def add_api_routes(app: FastAPI):
             else:
                 if model_info.get("modelVersions"):
                     version = model_info["modelVersions"][0]
-            
+
             if not version:
                 raise HTTPException(status_code=404, detail="Model version not found")
-            
+
             # Find primary file
             file_info = None
             for file in version.get("files", []):
                 if file.get("primary", False):
                     file_info = file
                     break
-            
+
             # If no primary file, use first file
             if not file_info and version.get("files"):
                 file_info = version["files"][0]
-            
+
             if not file_info:
                 raise HTTPException(status_code=404, detail="No files found for this model version")
-            
-            # Get filename and download URL
-            filename = file_info.get("name")
+
+            # Save under the caller's filename if given, otherwise Civitai's uploaded filename
+            filename = requested_filename or file_info.get("name")
             download_url = file_info.get("downloadUrl")
-            
+
             if not download_url:
                 raise HTTPException(status_code=404, detail="Download URL not found")
-            
-            # Create full path - add version ID to filename to avoid conflicts
-            name_without_ext, ext = os.path.splitext(filename)
-            versioned_filename = f"{name_without_ext}_{version.get('id')}{ext}"
-            dest_path = os.path.join(folder, versioned_filename)
-            
+
+            dest_path = os.path.join(folder, filename)
+
             # Download the file
-            print(f"Downloading {filename} to {dest_path}")
-            success = download_model_file(download_url, dest_path)
-            
+            print(f"Downloading {file_info.get('name')} to {dest_path}")
+            success, saved_path = download_model_file(download_url, dest_path)
+
             if not success:
                 raise HTTPException(status_code=500, detail="Download failed")
-            
+
             # Refresh model list if needed (for checkpoints and VAEs)
             if request.model_type.lower() in ["checkpoint", "ckpt", "vae"]:
                 from modules import sd_models
                 sd_models.list_models()
-            
+
             return {
                 "success": True,
                 "message": "Model downloaded successfully",
-                "file_path": dest_path,
+                "file_path": saved_path,
                 "model_id": request.model_id,
                 "version_id": version.get("id")
             }
-        
+
         except HTTPException:
             raise
         except Exception as e:
@@ -515,10 +534,10 @@ def add_api_routes(app: FastAPI):
             folder = get_model_folder(model_type)
             if not folder:
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=400,
                     detail=f"Invalid model type: {model_type}. Available types: checkpoint, lora, lycoris, embedding, hypernetwork, vae"
                 )
-            
+
             # List all files in the folder
             try:
                 files = os.listdir(folder)
@@ -528,12 +547,12 @@ def add_api_routes(app: FastAPI):
                     "folder": folder,
                     "exists": os.path.exists(folder)
                 }
-            
+
             # Filter by search term if provided
             if search_term:
                 search_term = search_term.lower()
                 files = [f for f in files if search_term in f.lower()]
-            
+
             # Return file details
             file_details = []
             for filename in files:
@@ -554,13 +573,13 @@ def add_api_routes(app: FastAPI):
                         "path": full_path,
                         "error": str(e)
                     })
-            
+
             return {
                 "folder": folder,
                 "file_count": len(files),
                 "files": file_details
             }
-        
+
         except HTTPException:
             raise
         except Exception as e:
@@ -571,17 +590,17 @@ def add_api_routes(app: FastAPI):
         """Get storage information for the system and model directories"""
         import shutil
         import subprocess
-        
+
         try:
             # Get system-wide storage info
             total, used, free = shutil.disk_usage("/")
-            
+
             # Convert to more readable format
             total_gb = round(total / (1024**3), 2)
             used_gb = round(used / (1024**3), 2)
             free_gb = round(free / (1024**3), 2)
             used_percent = round((used / total) * 100, 2)
-            
+
             # Get size of model directories
             model_sizes = {}
             for model_type in ["checkpoint", "lora", "lycoris", "embedding", "hypernetwork", "vae"]:
@@ -590,9 +609,9 @@ def add_api_routes(app: FastAPI):
                     try:
                         # Use du command for more accurate directory size calculation
                         result = subprocess.run(
-                            ["du", "-sh", folder], 
-                            capture_output=True, 
-                            text=True, 
+                            ["du", "-sh", folder],
+                            capture_output=True,
+                            text=True,
                             check=True
                         )
                         # Parse the output (format: "10M /path/to/folder")
@@ -606,7 +625,7 @@ def add_api_routes(app: FastAPI):
                                 fp = os.path.join(dirpath, f)
                                 if os.path.exists(fp):
                                     size_bytes += os.path.getsize(fp)
-                        
+
                         # Convert to human-readable format
                         if size_bytes < 1024:
                             size_str = f"{size_bytes}B"
@@ -616,26 +635,26 @@ def add_api_routes(app: FastAPI):
                             size_str = f"{round(size_bytes/(1024**2), 2)}MB"
                         else:
                             size_str = f"{round(size_bytes/(1024**3), 2)}GB"
-                        
+
                         model_sizes[model_type] = size_str
-            
+
             # Check if trash exists and get its size
             trash_dir = os.path.expanduser("~/.local/share/Trash")
             trash_exists = os.path.exists(trash_dir)
             trash_size = "0"
-            
+
             if trash_exists:
                 try:
                     result = subprocess.run(
-                        ["du", "-sh", trash_dir], 
-                        capture_output=True, 
-                        text=True, 
+                        ["du", "-sh", trash_dir],
+                        capture_output=True,
+                        text=True,
                         check=True
                     )
                     trash_size = result.stdout.strip().split()[0]
                 except (subprocess.SubprocessError, IndexError):
                     trash_size = "Unknown"
-            
+
             return {
                 "system": {
                     "total_gb": total_gb,
@@ -661,24 +680,24 @@ def add_api_routes(app: FastAPI):
             folder = get_model_folder(request.model_type)
             if not folder:
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=400,
                     detail=f"Invalid model type: {request.model_type}"
                 )
-            
+
             # Create full path
             file_path = os.path.join(folder, request.filename)
-            
+
             # Check if file exists
             if not os.path.exists(file_path):
                 # Try to find it with our more flexible matching
                 file_path = find_model_file(request.filename, request.model_type)
                 if not file_path:
                     raise HTTPException(status_code=404, detail=f"File not found: {request.filename}")
-            
+
             # Try moving to trash first (if available)
             import subprocess
             import shutil
-            
+
             try:
                 # First try using trash-cli if available
                 subprocess.run(["trash-put", file_path], check=True)
@@ -692,7 +711,7 @@ def add_api_routes(app: FastAPI):
                     # Fall back to direct removal
                     os.remove(file_path)
                     deletion_method = "direct"
-            
+
             # Empty trash if requested
             trash_emptied = False
             if request.empty_trash:
@@ -703,12 +722,12 @@ def add_api_routes(app: FastAPI):
                     trash_emptied = True
                 except subprocess.SubprocessError as e:
                     print(f"Error emptying trash: {str(e)}")
-            
+
             # Refresh model list if needed
             if request.model_type.lower() in ["checkpoint", "ckpt", "vae"]:
                 from modules import sd_models
                 sd_models.list_models()
-            
+
             return {
                 "success": True,
                 "deleted_file": os.path.basename(file_path),
@@ -716,7 +735,7 @@ def add_api_routes(app: FastAPI):
                 "trash_emptied": trash_emptied,
                 "path": file_path
             }
-        
+
         except HTTPException:
             raise
         except Exception as e:
@@ -765,7 +784,7 @@ def add_api_routes(app: FastAPI):
         # 3) direct
         os.remove(file_path)
         return "direct"
-    
+
     def _empty_trash_now() -> (bool, List[str]):
         import subprocess
         methods = []
@@ -793,7 +812,7 @@ def add_api_routes(app: FastAPI):
         trash_empty = not os.path.exists(os.path.expanduser("~/.local/share/Trash/files")) and \
                       not os.path.exists(os.path.expanduser("~/.local/share/Trash/info"))
         return (ok and trash_empty), methods
-    
+
     @app.post("/civitai/cleanup/older-than", response_model=CleanupResponse, tags=["Civitai Browser"])
     async def cleanup_models_older_than(request: CleanupRequest = Body(...)):
         """
@@ -805,13 +824,13 @@ def add_api_routes(app: FastAPI):
         try:
             known_types = ["checkpoint", "ckpt", "lora", "lycoris", "embedding", "hypernetwork", "vae"]
             target_types = request.model_types or known_types
-    
+
             cutoff_epoch = time.time() - (request.older_than_hours * 3600)
             total_candidates = 0
             total_deleted = 0
             freed_bytes = 0
             details: List[Dict[str, Any]] = []
-    
+
             for t in target_types:
                 folder = get_model_folder(t)
                 if not folder or not os.path.exists(folder):
@@ -821,7 +840,7 @@ def add_api_routes(app: FastAPI):
                         "error": "Folder not found or unsupported model_type"
                     })
                     continue
-    
+
                 try:
                     for entry in os.scandir(folder):
                         # Only regular files
@@ -832,7 +851,7 @@ def add_api_routes(app: FastAPI):
                             if mtime < cutoff_epoch:
                                 size_b = entry.stat(follow_symlinks=False).st_size
                                 total_candidates += 1
-    
+
                                 if request.dry_run:
                                     details.append({
                                         "model_type": t,
@@ -867,12 +886,12 @@ def add_api_routes(app: FastAPI):
                         "folder": folder,
                         "error": f"Error scanning folder: {e}"
                     })
-    
+
             trash_emptied = False
             methods_tried: List[str] = []
             if not request.dry_run and request.empty_trash:
                 trash_emptied, methods_tried = _empty_trash_now()
-    
+
             return CleanupResponse(
                 success=True,
                 dry_run=request.dry_run,
@@ -887,40 +906,40 @@ def add_api_routes(app: FastAPI):
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error during cleanup: {str(e)}")
-    
+
         # Empty trash endpoint
         @app.post("/civitai/empty-trash", tags=["Civitai Browser"])
         async def empty_trash():
             """Empty the system trash folder"""
             try:
                 import subprocess
-                
+
                 # Try to empty trash using various methods
                 trash_dir = os.path.expanduser("~/.local/share/Trash")
                 trash_exists = os.path.exists(trash_dir)
-                
+
                 if not trash_exists:
                     return {
                         "success": True,
                         "message": "Trash directory does not exist or is already empty"
                     }
-                
+
                 methods_tried = []
-                
+
                 # Try trash-empty command if available
                 try:
                     subprocess.run(["trash-empty"], check=True)
                     methods_tried.append("trash-empty command")
                 except (subprocess.SubprocessError, FileNotFoundError):
                     pass
-                
+
                 # Try gio trash --empty if available
                 try:
                     subprocess.run(["gio", "trash", "--empty"], check=True)
                     methods_tried.append("gio trash --empty command")
                 except (subprocess.SubprocessError, FileNotFoundError):
                     pass
-                
+
                 # Direct removal of trash directories
                 rm_success = True
                 try:
@@ -929,20 +948,20 @@ def add_api_routes(app: FastAPI):
                     methods_tried.append("direct rm -rf command")
                 except subprocess.SubprocessError:
                     rm_success = False
-                
+
                 # Check if trash is now empty
                 trash_empty = not os.path.exists(os.path.expanduser("~/.local/share/Trash/files")) and \
                               not os.path.exists(os.path.expanduser("~/.local/share/Trash/info"))
-                
+
                 return {
                     "success": trash_empty,
                     "methods_tried": methods_tried,
                     "trash_empty": trash_empty
                 }
-            
+
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error emptying trash: {str(e)}")
-    
+
     # Return our app with routes added
     return app
 
